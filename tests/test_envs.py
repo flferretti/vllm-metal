@@ -108,6 +108,8 @@ def test_a_bad_value_names_the_variable_and_the_value(
         ("VLLM_METAL_NAX_GQA_PREFILL", "1", True),
         ("VLLM_METAL_NAX_GQA_PREFILL", "0", False),
         ("VLLM_METAL_NAX_GQA_PREFILL", "yes", False),
+        ("VLLM_METAL_FUSED_VARLEN_ROPE", "1", True),
+        ("VLLM_METAL_FUSED_VARLEN_ROPE", "0", False),
         ("VLLM_METAL_BUILD_FROM_SOURCE", "yes", False),
     ],
 )
@@ -123,6 +125,7 @@ def test_a_good_value_parses(
     ("name", "expected"),
     [
         ("VLLM_METAL_GDN_LAZY_KERNELS", True),
+        ("VLLM_METAL_FUSED_VARLEN_ROPE", True),
         ("VLLM_METAL_DECODE_PIPELINE", True),
         ("VLLM_METAL_COMPILED_MLP", False),
         ("VLLM_METAL_NATIVE_SAMPLING", True),
