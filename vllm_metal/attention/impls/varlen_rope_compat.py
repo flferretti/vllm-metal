@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
+from functools import lru_cache
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -16,6 +19,9 @@ from mlx_lm.models.rope_utils import (
 )
 from mlx_vlm.models.lfm3.language import RotaryEmbedding as Lfm3RotaryEmbedding
 
+import vllm_metal.envs as envs
+from vllm_metal.metal import _read_v2_metal_source
+
 _VECTOR_OFFSET_ROPE_TYPES = (
     nn.RoPE,
     Llama3RoPE,
@@ -24,6 +30,232 @@ _VECTOR_OFFSET_ROPE_TYPES = (
     YarnRoPE,
     Lfm3RotaryEmbedding,
 )
+
+# Exact-type check keeps custom subclasses (e.g. call-recording test spies) and
+# monkeypatched wrappers on their Python __call__ path.
+_FUSED_VARLEN_ROPE_EXACT_TYPES = (
+    nn.RoPE,
+    Llama3RoPE,
+    ProportionalRoPE,
+    SuScaledRoPE,
+    YarnRoPE,
+)
+_SUPPORTED_FUSED_DTYPES = (mx.float16, mx.bfloat16, mx.float32)
+
+
+@lru_cache(maxsize=1)
+def _fused_varlen_rope_kernels() -> tuple[Any, Any, mx.array]:
+    source = _read_v2_metal_source("varlen_rope.metal")
+    qk_kernel = mx.fast.metal_kernel(
+        name="varlen_rope_qk_v2",
+        input_names=["q", "k", "cu_offsets", "params", "freqs"],
+        output_names=["out_q", "out_k"],
+        source=f"#define VARLEN_ROPE_APPLY_KEYS 1\n{source}\n#undef VARLEN_ROPE_APPLY_KEYS\n",
+        ensure_row_contiguous=False,
+    )
+    q_kernel = mx.fast.metal_kernel(
+        name="varlen_rope_q_v2",
+        input_names=["q", "cu_offsets", "params", "freqs"],
+        output_names=["out_q"],
+        source=f"#define VARLEN_ROPE_APPLY_KEYS 0\n{source}\n#undef VARLEN_ROPE_APPLY_KEYS\n",
+        ensure_row_contiguous=False,
+    )
+    dummy_freqs = mx.zeros((1,), dtype=mx.float32)
+    mx.eval(dummy_freqs)
+    return qk_kernel, q_kernel, dummy_freqs
+
+
+@lru_cache(maxsize=16)
+def _build_cu_offsets_array(
+    cu_tuple: tuple[int, ...], offsets_tuple: tuple[int, ...] | None
+) -> mx.array:
+    segment_count = len(cu_tuple) - 1
+    off_part = (0,) * segment_count if offsets_tuple is None else offsets_tuple
+    return mx.array(cu_tuple + off_part, dtype=mx.int32)
+
+
+@lru_cache(maxsize=32)
+def _build_rope_params_array(
+    dims: int, log2_base: float, pos_scale: float, mscale: float
+) -> mx.array:
+    return mx.array([float(dims), log2_base, pos_scale, mscale], dtype=mx.float32)
+
+
+def _extract_fused_rope_spec(
+    rope_fn: object,
+) -> tuple[int, bool, float, float, float, mx.array | None] | None:
+    rope_type = type(rope_fn)
+    if rope_type not in _FUSED_VARLEN_ROPE_EXACT_TYPES:
+        return None
+    if rope_type is nn.RoPE:
+        assert isinstance(rope_fn, nn.RoPE)
+        if rope_fn.base <= 0:
+            return None
+        return (
+            int(rope_fn.dims),
+            bool(rope_fn.traditional),
+            math.log2(float(rope_fn.base)),
+            float(rope_fn.scale),
+            1.0,
+            None,
+        )
+    if rope_type is Llama3RoPE or rope_type is ProportionalRoPE:
+        return (
+            int(rope_fn.dims),  # type: ignore[attr-defined]
+            bool(rope_fn.traditional),  # type: ignore[attr-defined]
+            0.0,
+            1.0,
+            1.0,
+            rope_fn._freqs,  # type: ignore[attr-defined]
+        )
+    if rope_type is SuScaledRoPE:
+        assert isinstance(rope_fn, SuScaledRoPE)
+        return (
+            int(rope_fn.dim),
+            False,
+            0.0,
+            1.0,
+            float(rope_fn._scale),
+            rope_fn._freqs,
+        )
+    assert isinstance(rope_fn, YarnRoPE)
+    return (
+        int(rope_fn.dims),
+        bool(rope_fn.traditional),
+        0.0,
+        1.0,
+        float(rope_fn.mscale),
+        rope_fn._freqs,
+    )
+
+
+_HEADS_PER_THREAD = 8
+
+
+def _threadgroup_3d(half_head: int, total_tokens: int) -> tuple[int, int, int]:
+    if half_head >= 64:
+        tg_x = 64
+    elif half_head >= 32:
+        tg_x = 32
+    else:
+        tg_x = max(1, half_head)
+    tg_z = min(max(1, total_tokens), max(1, 256 // tg_x))
+    return (tg_x, 1, tg_z)
+
+
+def _dispatch_single_varlen_rope(
+    x: mx.array,
+    cu_offsets: mx.array,
+    params: mx.array,
+    freqs_buf: mx.array,
+    traditional: bool,
+    has_freqs: bool,
+) -> mx.array:
+    _, q_kernel, _ = _fused_varlen_rope_kernels()
+    _, heads, total_tokens, head_dim = x.shape
+    half_head = (head_dim + 1) // 2
+    head_groups = (heads + _HEADS_PER_THREAD - 1) // _HEADS_PER_THREAD
+    (out,) = q_kernel(
+        inputs=[x, cu_offsets, params, freqs_buf],
+        template=[
+            ("T", x.dtype),
+            ("TRADITIONAL", traditional),
+            ("HAS_FREQS", has_freqs),
+        ],
+        output_shapes=[x.shape],
+        output_dtypes=[x.dtype],
+        grid=(half_head, head_groups, total_tokens),
+        threadgroup=_threadgroup_3d(half_head, total_tokens),
+    )
+    return out
+
+
+def _try_fused_varlen_rope(
+    rope_fn: object,
+    queries: mx.array,
+    keys: mx.array,
+    cu_seqlens: list[int],
+    offsets: list[int] | None,
+    apply_keys: bool,
+) -> tuple[mx.array, mx.array] | None:
+    spec = _extract_fused_rope_spec(rope_fn)
+    if spec is None:
+        return None
+    dims, traditional, log2_base, pos_scale, mscale, freqs = spec
+    if queries.ndim != 4 or queries.shape[0] != 1:
+        return None
+    if queries.dtype not in _SUPPORTED_FUSED_DTYPES:
+        return None
+    _, h_q, total_tokens, head_dim = queries.shape
+    if dims <= 0 or dims % 2 != 0 or dims > head_dim:
+        return None
+    segment_count = len(cu_seqlens) - 1
+    if segment_count < 1:
+        return queries, keys
+    if cu_seqlens[0] != 0 or cu_seqlens[-1] != total_tokens:
+        return None
+    if offsets is not None and len(offsets) != segment_count:
+        return None
+    if apply_keys and (
+        keys.ndim != 4
+        or keys.shape[0] != 1
+        or keys.shape[2] != total_tokens
+        or keys.dtype not in _SUPPORTED_FUSED_DTYPES
+        or dims > keys.shape[3]
+    ):
+        return None
+    if total_tokens == 0:
+        return queries, keys
+
+    qk_kernel, _, dummy_freqs = _fused_varlen_rope_kernels()
+    cu_offsets = _build_cu_offsets_array(
+        tuple(cu_seqlens), None if offsets is None else tuple(offsets)
+    )
+    params = _build_rope_params_array(dims, log2_base, pos_scale, mscale)
+    has_freqs = freqs is not None
+    freqs_buf = freqs if freqs is not None else dummy_freqs
+
+    if (
+        apply_keys
+        and keys.shape[3] == head_dim
+        and keys.dtype == queries.dtype
+        and keys.shape[1] > 0
+        and h_q > 0
+    ):
+        half_head = (head_dim + 1) // 2
+        total_heads = h_q + keys.shape[1]
+        head_groups = (total_heads + _HEADS_PER_THREAD - 1) // _HEADS_PER_THREAD
+        out_q, out_k = qk_kernel(
+            inputs=[queries, keys, cu_offsets, params, freqs_buf],
+            template=[
+                ("T", queries.dtype),
+                ("TRADITIONAL", traditional),
+                ("HAS_FREQS", has_freqs),
+            ],
+            output_shapes=[queries.shape, keys.shape],
+            output_dtypes=[queries.dtype, queries.dtype],
+            grid=(half_head, head_groups, total_tokens),
+            threadgroup=_threadgroup_3d(half_head, total_tokens),
+        )
+        return out_q, out_k
+
+    out_q = (
+        _dispatch_single_varlen_rope(
+            queries, cu_offsets, params, freqs_buf, traditional, has_freqs
+        )
+        if h_q > 0
+        else queries
+    )
+    if not apply_keys:
+        return out_q, keys
+    out_k = (
+        _dispatch_single_varlen_rope(
+            keys, cu_offsets, params, freqs_buf, traditional, has_freqs
+        )
+        if keys.shape[1] > 0
+        else keys
+    )
+    return out_q, out_k
 
 
 def _apply_single_token_batched_rope(
@@ -192,6 +424,18 @@ def apply_packed_rope(
             return rotated_q, keys
         rotated_k = _apply_single_token_batched_rope(rope_fn, keys, batch_offsets)
         return rotated_q, rotated_k
+
+    if (
+        rope_fn is not None
+        and positions is None
+        and segment_count > 1
+        and envs.VLLM_METAL_FUSED_VARLEN_ROPE
+    ):
+        fused = _try_fused_varlen_rope(
+            rope_fn, queries, keys, cu_seqlens, offsets, apply_keys
+        )
+        if fused is not None:
+            return fused
 
     if rotary_emb is not None:
         # Each token rotates independently through the model's own M-RoPE.

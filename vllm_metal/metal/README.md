@@ -46,6 +46,7 @@ MLX, via `_read_v2_metal_source`:
 | `gdn_conv1d_silu_prefill.metal` | `gdn_conv1d_silu_prefill_v2` |
 | `gdn_recurrent_decode.metal` | `gdn_recurrent_decode_v2` |
 | `gdn_recurrent_prefill.metal` | `gdn_recurrent_prefill_v2` |
+| `varlen_rope.metal` | `varlen_rope_qk_v2` / `varlen_rope_q_v2` |
 
 Recurrent prefill uses one source with a compile-time `Packed` parameter. Within
 the existing lazy prefill eligibility checks, key head dimension 128 and value
@@ -73,6 +74,7 @@ pure decode retains its existing kernel. There is no separate packed user switch
 | `gdn_conv1d_silu_prefill.metal` | Lazy GDN prefill: causal conv1d + SiLU. |
 | `gdn_recurrent_decode.metal` | Lazy GDN decode: recurrent state update. |
 | `gdn_recurrent_prefill.metal` | Lazy GDN prefill: recurrent state updates over packed sequences. |
+| `varlen_rope.metal` | Fused packed/varlen RoPE for strided MLX Q/K tensors across ragged `cu_seqlens` and offsets. |
 
 ### D512 NAX prefill
 
