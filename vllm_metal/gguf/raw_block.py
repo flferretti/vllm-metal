@@ -466,6 +466,13 @@ _GATHER_QMV_LEGACY_MAX_ASSIGNMENTS_PER_EXPERT = 2
 
 _SIMD_LANES = 32
 _SIMDGROUPS_PER_TG = 2
+_FAST_QMV_QTYPES: frozenset[GGMLQuantizationType] = frozenset(
+    (
+        GGMLQuantizationType.Q2_K,
+        GGMLQuantizationType.Q3_K,
+        GGMLQuantizationType.Q6_K,
+    )
+)
 
 
 @lru_cache(maxsize=1)
@@ -685,9 +692,12 @@ class GGUFRawBlockTensor:
         """Materialize the packed bytes backing this quantized tensor."""
         mx.eval(self.qweight)
 
+    def _use_fast_qmv(self) -> bool:
+        return envs.VLLM_METAL_GGUF_FAST_QMV and self.qweight_type in _FAST_QMV_QTYPES
+
     def _qmv(self, x: mx.array) -> mx.array:
         batch = x.shape[0]
-        if envs.VLLM_METAL_GGUF_FAST_QMV:
+        if self._use_fast_qmv():
             _, qmv_kernel, _ = _fast_kernels()
             nr = 4 if batch <= 4 else 2
             row_groups = (self.out_features + nr - 1) // nr
@@ -696,7 +706,7 @@ class GGUFRawBlockTensor:
                 inputs=[self.qweight, x],
                 template=[
                     ("T", x.dtype),
-                    ("QTYPE", self.bits),
+                    ("QTYPE", int(self.qweight_type)),
                     ("NB", batch),
                     ("NR", nr),
                 ],
@@ -724,13 +734,13 @@ class GGUFRawBlockTensor:
         """Dequantize packed byte rows into an ``(rows, in)`` array."""
         n_rows = packed_rows.shape[0]
         n_elements = n_rows * self.in_features
-        if envs.VLLM_METAL_GGUF_FAST_QMV:
+        if self._use_fast_qmv():
             dequant_kernel, _, _ = _fast_kernels()
             total_chunks = n_elements // 8
             tg_x = min(_KERNEL_THREADGROUP, max(1, total_chunks))
             (out,) = dequant_kernel(
                 inputs=[packed_rows],
-                template=[("T", output_dtype), ("QTYPE", self.bits)],
+                template=[("T", output_dtype), ("QTYPE", int(self.qweight_type))],
                 output_shapes=[(n_rows, self.in_features)],
                 output_dtypes=[output_dtype],
                 grid=(total_chunks, 1, 1),
@@ -779,7 +789,7 @@ class GGUFRawBlockTensor:
             )
         assignment_shape = mx.broadcast_shapes(tuple(batch_dims), indices.shape)
         idx = mx.broadcast_to(indices, assignment_shape).flatten()
-        use_fast_qmv = envs.VLLM_METAL_GGUF_FAST_QMV
+        use_fast_qmv = self._use_fast_qmv()
         assignments_per_expert = (
             _GATHER_QMV_MAX_ASSIGNMENTS_PER_EXPERT
             if use_fast_qmv
@@ -844,7 +854,7 @@ class GGUFRawBlockTensor:
             template=[
                 ("T", x_2d.dtype),
                 ("IdxT", idx.dtype),
-                ("QTYPE", self.bits),
+                ("QTYPE", int(self.qweight_type)),
                 ("NB", 1),
                 ("NR", nr),
                 ("NUM_EXPERTS", num_experts),

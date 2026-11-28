@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
-constexpr uint BLOCK_BYTES = (QTYPE == 2) ? 84u : ((QTYPE == 3) ? 110u : 210u);
-static_assert(QTYPE == 2 || QTYPE == 3 || QTYPE == 6,
+// GGMLQuantizationType values so non-K-quant raw blocks cannot alias by bit-width.
+constexpr uint QTYPE_Q2_K = 10u;
+constexpr uint QTYPE_Q3_K = 11u;
+constexpr uint QTYPE_Q6_K = 14u;
+constexpr uint BLOCK_BYTES =
+    (QTYPE == QTYPE_Q2_K) ? 84u : ((QTYPE == QTYPE_Q3_K) ? 110u : 210u);
+static_assert(QTYPE == QTYPE_Q2_K || QTYPE == QTYPE_Q3_K || QTYPE == QTYPE_Q6_K,
               "Unsupported GGUF raw-block QTYPE");
 static_assert(alignof(packed_ushort4) == 2,
               "packed_ushort4 must be 2-byte aligned for 110B/210B superblocks");
@@ -80,7 +85,7 @@ auto unpack_q6k = [&](device const uint8_t* b, uint lane,
     device const uint8_t* b = blocks + (size_t)block * BLOCK_BYTES;
     device T* dst = out + (size_t)tid * 8u;
 
-    if constexpr (QTYPE == 2) {
+    if constexpr (QTYPE == QTYPE_Q2_K) {
         uchar4 c0, c1;
         float s, m;
         unpack_q2k(b, lane, c0, c1, s, m);
@@ -95,7 +100,7 @@ auto unpack_q6k = [&](device const uint8_t* b, uint lane,
     } else {
         char4 q0, q1;
         float s;
-        if constexpr (QTYPE == 3) {
+        if constexpr (QTYPE == QTYPE_Q3_K) {
             unpack_q3k(b, lane, q0, q1, s);
         } else {
             unpack_q6k(b, lane, q0, q1, s);
@@ -146,7 +151,7 @@ auto unpack_q6k = [&](device const uint8_t* b, uint lane,
                                 thread const float xv[NB][8],
                                 thread const float xsum[NB],
                                 thread float row_acc[NB]) {
-        if constexpr (QTYPE == 2) {
+        if constexpr (QTYPE == QTYPE_Q2_K) {
             uchar4 c0, c1;
             float s, m;
             unpack_q2k(b, lane, c0, c1, s, m);
@@ -164,7 +169,7 @@ auto unpack_q6k = [&](device const uint8_t* b, uint lane,
             (void)xsum;
             char4 q0, q1;
             float s;
-            if constexpr (QTYPE == 3) {
+            if constexpr (QTYPE == QTYPE_Q3_K) {
                 unpack_q3k(b, lane, q0, q1, s);
             } else {
                 unpack_q6k(b, lane, q0, q1, s);
@@ -197,7 +202,7 @@ auto unpack_q6k = [&](device const uint8_t* b, uint lane,
             for (uint i = 0; i < 8; ++i) {
                 xv[batch][i] = float(xp[i]);
             }
-            if constexpr (QTYPE == 2) {
+            if constexpr (QTYPE == QTYPE_Q2_K) {
                 xsum[batch] = ((xv[batch][0] + xv[batch][1]) + (xv[batch][2] + xv[batch][3]))
                             + ((xv[batch][4] + xv[batch][5]) + (xv[batch][6] + xv[batch][7]));
             } else {

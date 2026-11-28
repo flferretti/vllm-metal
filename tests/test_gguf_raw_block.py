@@ -25,6 +25,13 @@ _RAW_QTYPES = [
     GGMLQuantizationType.IQ3_XXS,
     GGMLQuantizationType.IQ2_S,
 ]
+_FAST_QTYPES = frozenset(
+    (
+        GGMLQuantizationType.Q2_K,
+        GGMLQuantizationType.Q3_K,
+        GGMLQuantizationType.Q6_K,
+    )
+)
 
 
 def _spy_matmul_paths(monkeypatch) -> dict:
@@ -325,21 +332,24 @@ def _assert_close_to(out: mx.array, expected: mx.array) -> None:
 
 @pytest.mark.parametrize("qtype", _RAW_QTYPES)
 @pytest.mark.parametrize(
-    ("fast_flag", "tokens", "dequantizes"),
+    ("fast_flag", "tokens"),
     [
-        ("0", 4, False),
-        ("0", 5, True),
-        ("1", 1, False),
-        ("1", 5, False),
-        ("1", 16, False),
-        ("1", 17, True),
+        ("0", 4),
+        ("0", 5),
+        ("1", 1),
+        ("1", 4),
+        ("1", 5),
+        ("1", 16),
+        ("1", 17),
     ],
 )
-def test_gather_matmul_matches_expert_oracle(
-    monkeypatch, qtype, fast_flag, tokens, dequantizes
-):
+def test_gather_matmul_matches_expert_oracle(monkeypatch, qtype, fast_flag, tokens):
     # SwitchGLU's unsorted call: x (B, L, 1, 1, in) routed by indices (B, L, k).
+    # Fast SIMD K-quants switch to dense above 8 assignments/expert; legacy and
+    # IQ raw-block qtypes keep the 2 assignments/expert cutoff even with =1.
     monkeypatch.setenv("VLLM_METAL_GGUF_FAST_QMV", fast_flag)
+    uses_fast = fast_flag == "1" and qtype in _FAST_QTYPES
+    dequantizes = (tokens * 2) > (8 if uses_fast else 2) * _NUM_EXPERTS
     qt, experts = _make_expert_tensor(qtype)
     calls = _spy_matmul_paths(monkeypatch)
     x = mx.random.normal((1, tokens, 1, 1, qt.in_features))
@@ -352,8 +362,9 @@ def test_gather_matmul_matches_expert_oracle(
     _assert_close_to(out, _gather_oracle(x, indices, experts))
 
 
-# 16 tokens x top-2 runs gather QMV and 17 the dense arm; tolerances as for matmul.
-@pytest.mark.parametrize("tokens", [16, 17])
+# 4 tokens hits gather QMV for every qtype, 16 hits the fast upper boundary
+# (and dense for IQ), and 17 hits dense for every qtype; tolerances as for matmul.
+@pytest.mark.parametrize("tokens", [4, 16, 17])
 @pytest.mark.parametrize(
     ("dtype", "rel_tol"), [(mx.float16, 4e-3), (mx.bfloat16, 8e-3)]
 )
@@ -380,16 +391,13 @@ def test_gather_matmul_low_precision_matches_expert_oracle(
     )
 
 
-@pytest.mark.parametrize(
-    ("assignments", "dequantizes"), [(8, False), (64, False), (65, True)]
-)
+@pytest.mark.parametrize("assignments", [8, 16, 17, 64, 65])
 @pytest.mark.parametrize("qtype", _RAW_QTYPES)
-def test_gather_matmul_sorted_matches_expert_oracle(
-    monkeypatch, qtype, assignments, dequantizes
-):
+def test_gather_matmul_sorted_matches_expert_oracle(monkeypatch, qtype, assignments):
     # SwitchGLU sorts 64+ assignments into x (N, 1, in) with ascending indices.
     monkeypatch.setenv("VLLM_METAL_GGUF_FAST_QMV", "1")
     num_experts = 8
+    dequantizes = assignments > (8 if qtype in _FAST_QTYPES else 2) * num_experts
     qt, experts = _make_expert_tensor(qtype, num_experts)
     calls = _spy_matmul_paths(monkeypatch)
     x = mx.random.normal((assignments, 1, qt.in_features))
